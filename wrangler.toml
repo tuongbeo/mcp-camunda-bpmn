@@ -1,0 +1,21 @@
+name = "mcp-camunda-bpmn"
+main = "src/cloudflare/index.ts"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Durable Object — one instance per MCP session
+[[durable_objects.bindings]]
+name = "MCP_BPMN_AGENT"
+class_name = "BpmnMcpAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BpmnMcpAgent"]
+
+# KV — persistent BPMN file storage (cross-session)
+[[kv_namespaces]]
+binding = "BPMN_FILES"
+id = "3001cbc000244b88831db8456c91306c"
+
+[vars]
+ENVIRONMENT = "production"

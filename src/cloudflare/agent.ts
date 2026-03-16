@@ -147,12 +147,31 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     }, async ({ filename }) => {
       try {
-        const xml = await this.env.BPMN_FILES.get(`bpmn:${filename}`);
+        // Normalize: try exact filename first, then with .bpmn appended, then without extension
+        const candidates = [
+          filename,
+          filename.endsWith('.bpmn') ? filename : `${filename}.bpmn`,
+          filename.replace(/\.bpmn$/, ''),
+        ];
+        let xml: string | null = null;
+        let resolvedFilename = filename;
+        for (const candidate of candidates) {
+          xml = await this.env.BPMN_FILES.get(`bpmn:${candidate}`);
+          if (xml) { resolvedFilename = candidate; break; }
+        }
         if (!xml) return this.err(`"${filename}" not found. Use list_diagrams.`);
         const p = parseXmlToState(xml);
-        const diagram: CurrentDiagram = { processId: p.processId ?? generateId('Process'), name: p.name ?? filename.replace('.bpmn', ''), type: 'process', xml, filename, lastModified: new Date().toISOString(), elements: p.elements ?? {}, connections: p.connections ?? {} };
+        const diagram: CurrentDiagram = {
+          processId: p.processId ?? generateId('Process'),
+          name: p.name ?? resolvedFilename.replace('.bpmn', ''),
+          type: 'process', xml,
+          filename: resolvedFilename,
+          lastModified: new Date().toISOString(),
+          elements: p.elements ?? {},
+          connections: p.connections ?? {},
+        };
         await this.setState({ currentDiagram: diagram });
-        return this.ok(`Opened "${filename}": ${Object.keys(diagram.elements).length} elements, ${Object.keys(diagram.connections).length} connections.`);
+        return this.ok(`Opened "${resolvedFilename}": ${Object.keys(diagram.elements).length} elements, ${Object.keys(diagram.connections).length} connections.`);
       } catch (e) { return this.err((e as Error).message); }
     });
 
@@ -165,8 +184,10 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
       try {
         const d = this.getDiagram();
         const fn = filename.endsWith('.bpmn') ? filename : `${filename}.bpmn`;
-        await this.env.BPMN_FILES.put(`bpmn:${fn}`, d.xml);
-        await this.setState({ currentDiagram: { ...d, filename: fn } });
+        // Always regenerate XML from in-memory state to ensure all Zeebe properties are serialized
+        const freshXml = generateXml(d);
+        await this.env.BPMN_FILES.put(`bpmn:${fn}`, freshXml);
+        await this.setState({ currentDiagram: { ...d, filename: fn, xml: freshXml } });
         return this.ok(`Saved "${d.name}" → "${fn}".`);
       } catch (e) { return this.err((e as Error).message); }
     });
@@ -503,9 +524,37 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     }, async ({ elementId, timerType, timerValue }) => {
       try {
-        const props: Record<string, unknown> = { eventDefinition: 'timer' };
-        props[timerType === 'duration' ? 'timerDuration' : timerType === 'cycle' ? 'timerCycle' : 'timerDate'] = timerValue;
-        return await this.patchElementProps(elementId, props);
+        const d = this.getDiagram();
+        const el = d.elements[elementId];
+        if (!el) return this.err(`Element "${elementId}" not found.`);
+
+        const timerPropKey = timerType === 'duration' ? 'timerDuration' : timerType === 'cycle' ? 'timerCycle' : 'timerDate';
+        const props: Record<string, unknown> = { eventDefinition: 'timer', [timerPropKey]: timerValue };
+
+        // If boundary timer event already has attachedToRef, snap position to host
+        const attachedToRef = el.properties.attachedToRef as string | undefined;
+        let updatedPosition = el.position;
+        if (el.type === 'bpmn:BoundaryEvent' && attachedToRef) {
+          const hostEl = d.elements[attachedToRef];
+          if (hostEl) {
+            const existingOnHost = Object.values(d.elements).filter(
+              e => e.type === 'bpmn:BoundaryEvent'
+                && e.properties.attachedToRef === attachedToRef
+                && e.id !== elementId
+            );
+            const hSz = getSize(hostEl.type);
+            const hW = hostEl.size?.width ?? hSz.width;
+            const hH = hostEl.size?.height ?? hSz.height;
+            updatedPosition = {
+              x: hostEl.position.x + Math.round(hW * 0.25) + existingOnHost.length * 40,
+              y: hostEl.position.y + hH - 18,
+            };
+          }
+        }
+
+        const updated = { ...el, position: updatedPosition, properties: { ...el.properties, ...props } };
+        await this.saveDiagram({ ...d, elements: { ...d.elements, [elementId]: updated } });
+        return this.ok(`Updated BoundaryEvent "${el.name || elementId}".`);
       } catch (e) { return this.err((e as Error).message); }
     });
 
@@ -535,8 +584,42 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
       inputSchema: z.object({ elementId: z.string(), hostElementId: z.string(), errorCode: z.string().optional(), errorMessage: z.string().optional() }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     }, async ({ elementId, hostElementId, errorCode, errorMessage }) => {
-      try { return await this.patchElementProps(elementId, { eventDefinition: 'error', attachedToRef: hostElementId, errorCode, errorMessage }); }
-      catch (e) { return this.err((e as Error).message); }
+      try {
+        const d = this.getDiagram();
+        const hostEl = d.elements[hostElementId];
+        if (!hostEl) return this.err(`Host element "${hostElementId}" not found.`);
+        const boundaryEl = d.elements[elementId];
+        if (!boundaryEl) return this.err(`Boundary event "${elementId}" not found.`);
+
+        // Count existing boundary events on same host to offset X position
+        const existingOnHost = Object.values(d.elements).filter(
+          e => e.type === 'bpmn:BoundaryEvent'
+            && e.properties.attachedToRef === hostElementId
+            && e.id !== elementId
+        );
+        const hSz = getSize(hostEl.type);
+        const hW = hostEl.size?.width ?? hSz.width;
+        const hH = hostEl.size?.height ?? hSz.height;
+        const newPosition = {
+          x: hostEl.position.x + Math.round(hW * 0.25) + existingOnHost.length * 40,
+          y: hostEl.position.y + hH - 18,
+        };
+
+        // Update both properties and position
+        const updatedBoundary = {
+          ...boundaryEl,
+          position: newPosition,
+          properties: {
+            ...boundaryEl.properties,
+            eventDefinition: 'error',
+            attachedToRef: hostElementId,
+            ...(errorCode ? { errorCode } : {}),
+            ...(errorMessage ? { errorMessage } : {}),
+          },
+        };
+        await this.saveDiagram({ ...d, elements: { ...d.elements, [elementId]: updatedBoundary } });
+        return this.ok(`Updated BoundaryEvent "${boundaryEl.name || elementId}".`);
+      } catch (e) { return this.err((e as Error).message); }
     });
 
     this.server.registerTool('set_multi_instance', {
@@ -703,11 +786,11 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
         const results: string[] = [];
         if (prefix === 'bpmn' || prefix === 'all') {
           const list = await this.env.BPMN_FILES.list({ prefix: 'bpmn:' });
-          results.push(...list.keys.map(k => `  [BPMN] ${k.name.replace('bpmn:', '')}`));
+          results.push(...list.keys.map((k: { name: string }) => `  [BPMN] ${k.name.replace('bpmn:', '')}`));
         }
         if (prefix === 'dmn' || prefix === 'all') {
           const list = await this.env.BPMN_FILES.list({ prefix: 'dmn:' });
-          results.push(...list.keys.map(k => `  [DMN]  ${k.name.replace('dmn:', '')}`));
+          results.push(...list.keys.map((k: { name: string }) => `  [DMN]  ${k.name.replace('dmn:', '')}`));
         }
         if (!results.length) return this.ok('No saved files found. Use save_as to save the current diagram.');
         return this.ok(`Files (${results.length}):\n${results.join('\n')}`);
@@ -770,37 +853,103 @@ export class BpmnMcpAgent extends McpAgent<Env, BpmnState> {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     }, async ({ description, processName, style }) => {
       try {
+        // ── Step extraction: parse sentences into proper BPMN step names ──────
+        const extractStepName = (sentence: string): { name: string; isDecision: boolean; isEnd: boolean } => {
+          const s = sentence.trim();
+          const isDecision = /\b(check|decide|approve|review|branch|condition|if|whether|valid|invalid|kiểm tra|phê duyệt|quyết định|nếu|xét duyệt)\b/i.test(s);
+          const isEnd = /\b(complete|done|finish|end|reject|cancel|notify|xong|hoàn thành|từ chối|kết thúc)\b/i.test(s);
+
+          // Remove filler phrases (Vietnamese + English)
+          let clean = s
+            // Strip subject prefix
+            .replace(/^(Hệ thống tự động|Hệ thống|Khách hàng|Người dùng|System automatically|System|User|Customer)\s+/i, '')
+            // Vietnamese: "Nếu X thì Y" → keep Y (the action)
+            .replace(/^Nếu\s+[^,]+,?\s+thì\s+/i, '')
+            // Vietnamese: "Sau khi X, hệ thống Y" → strip "Sau khi X, " then strip subject again
+            .replace(/^Sau khi\s+[^,]+,\s*/i, '')
+            .replace(/^(Hệ thống tự động|Hệ thống|Khách hàng)\s+/i, '')
+            // English: "If X then Y" → keep Y
+            .replace(/^If\s+[^,]+,?\s+then\s+/i, '')
+            // English: "After X, Y" → keep Y
+            .replace(/^After\s+[^,]+,\s*/i, '')
+            .trim();
+
+          // Extract verb + object (first 5 words, title-case)
+          const words = clean.split(/\s+/).slice(0, 5);
+          const name = words
+            .map((w, i) => i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase())
+            .join(' ')
+            .replace(/[,.:;]$/, '');
+
+          return { name: name || s.substring(0, 40), isDecision, isEnd };
+        };
+
         const processId = generateId('Process');
         const elements: Record<string, BpmnElement> = {};
         const connections: Record<string, BpmnConnection> = {};
-        const sentences = description.split(/[.\n;]/).map(s => s.trim()).filter(s => s.length > 5).slice(0, style === 'simple' ? 6 : 10);
+
+        // Split on sentence boundaries, filter short/empty, take first N
+        const sentences = description
+          .split(/(?<=[.;\n])|(?<=\b(?:sau đó|then|tiếp theo|next|sau khi phê duyệt|rồi)\b)/i)
+          .map(s => s.trim())
+          .filter(s => s.length > 8 && !/^(và|và|hoặc|or|and)$/i.test(s))
+          .slice(0, style === 'simple' ? 5 : 9);
 
         const startId = generateId('StartEvent');
-        elements[startId] = { id: startId, type: 'bpmn:StartEvent', name: 'Start', position: { x: 100, y: 200 }, size: { width: 36, height: 36 }, properties: {} };
-        let prevId = startId; let x = 220;
+        elements[startId] = {
+          id: startId, type: 'bpmn:StartEvent',
+          name: 'Start', position: { x: 100, y: 200 },
+          size: { width: 36, height: 36 }, properties: {},
+        };
+        let prevId = startId;
+        let x = 220;
+        const pendingGateways: Array<{ gwId: string; sentence: string }> = [];
 
         for (const sentence of sentences) {
-          const isDecision = /\b(check|decide|approve|review|branch|condition|if|whether|kiểm tra|phê duyệt|quyết định)\b/i.test(sentence);
+          const { name, isDecision } = extractStepName(sentence);
           const type = isDecision ? 'bpmn:ExclusiveGateway' : 'bpmn:ServiceTask';
           const sz = getSize(type);
           const elId = generateId(isDecision ? 'Gateway' : 'Task');
-          elements[elId] = { id: elId, type, name: sentence.substring(0, 50), position: { x, y: isDecision ? 213 : 200 }, size: sz, properties: isDecision ? {} : { zeebeTaskType: sentence.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 40) } };
+          elements[elId] = {
+            id: elId, type, name,
+            position: { x, y: isDecision ? 213 : 200 }, size: sz,
+            properties: isDecision ? {} : {
+              zeebeTaskType: name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, ''),
+            },
+          };
           const fid = generateId('Flow');
           connections[fid] = { id: fid, source: prevId, target: elId, type: 'bpmn:SequenceFlow' };
-          prevId = elId; x += sz.width + 60;
+          if (isDecision) pendingGateways.push({ gwId: elId, sentence });
+          prevId = elId;
+          x += sz.width + 60;
         }
 
         const endId = generateId('EndEvent');
-        elements[endId] = { id: endId, type: 'bpmn:EndEvent', name: 'End', position: { x, y: 200 }, size: { width: 36, height: 36 }, properties: {} };
-        connections[generateId('Flow')] = { id: generateId('Flow'), source: prevId, target: endId, type: 'bpmn:SequenceFlow' };
+        elements[endId] = {
+          id: endId, type: 'bpmn:EndEvent',
+          name: 'End', position: { x, y: 200 },
+          size: { width: 36, height: 36 }, properties: {},
+        };
+        const lastFid = generateId('Flow');
+        connections[lastFid] = { id: lastFid, source: prevId, target: endId, type: 'bpmn:SequenceFlow' };
 
-        const diagram: CurrentDiagram = { processId, name: processName, type: 'process', xml: '', filename: null, lastModified: new Date().toISOString(), elements, connections };
+        const laidOut = applyAutoLayout(elements, connections);
+        const diagram: CurrentDiagram = { processId, name: processName, type: 'process', xml: '', filename: null, lastModified: new Date().toISOString(), elements: laidOut, connections };
         diagram.xml = generateXml(diagram);
         await this.setState({ currentDiagram: diagram });
 
         const taskCount = Object.values(elements).filter(e => e.type.includes('Task')).length;
         const gwCount = Object.values(elements).filter(e => e.type.includes('Gateway')).length;
-        return this.ok(`Generated BPMN: "${processName}"\n  ${taskCount} tasks, ${gwCount} gateways, ${Object.keys(connections).length} flows\n\nNext:\n  • list_elements — review generated elements\n  • set_zeebe_task_definition — configure service tasks\n  • validate_camunda8 — check compliance\n  • export — get BPMN XML`);
+        return this.ok([
+          `Generated BPMN: "${processName}"`,
+          `  ${taskCount} tasks, ${gwCount} gateways, ${Object.keys(connections).length} flows`,
+          ``,
+          `Next:`,
+          `  • list_elements — review generated elements`,
+          `  • set_zeebe_task_definition — configure service tasks`,
+          `  • validate_camunda8 — check compliance`,
+          `  • export — get BPMN XML`,
+        ].join('\n'));
       } catch (e) { return this.err((e as Error).message); }
     });
 

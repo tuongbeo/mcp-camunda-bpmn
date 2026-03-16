@@ -268,6 +268,23 @@ export function generateXml(diagram: CurrentDiagram): string {
   let elementXml = '';
   let diagramXml = '';
 
+  // Collect bpmn:message declarations needed at definitions level
+  const messageDeclarations: string[] = [];
+  const messageRefMap = new Map<string, string>(); // messageName → messageId
+  for (const el of elList) {
+    const props = el.properties;
+    if (props.eventDefinition === 'message' && props.messageName) {
+      const msgName = props.messageName as string;
+      if (!messageRefMap.has(msgName)) {
+        const msgId = generateId('Message');
+        messageRefMap.set(msgName, msgId);
+        messageDeclarations.push(`  <bpmn:message id="${msgId}" name="${esc(msgName)}" />`);
+      }
+      // Store resolved messageRef back so event definition can use it
+      props.messageRef = messageRefMap.get(msgName);
+    }
+  }
+
   for (const el of elList) {
     const tag = getTagName(el.type);
     const sz = getSize(el.type);
@@ -393,9 +410,15 @@ export function generateXml(diagram: CurrentDiagram): string {
       const evtDef = props.eventDefinition as string;
       const evtId = generateId(evtDef + 'EventDefinition');
       switch (evtDef) {
-        case 'message':
-          eventDefXml = `\n      <bpmn:messageEventDefinition id="${evtId}"${props.messageRef ? ` messageRef="${esc(props.messageRef as string)}"` : ''} />`;
+        case 'message': {
+          const msgRef = props.messageRef ? ` messageRef="${esc(props.messageRef as string)}"` : '';
+          eventDefXml = `\n      <bpmn:messageEventDefinition id="${evtId}"${msgRef} />`;
+          // Add zeebe:subscription for correlation if correlationKey is set
+          if (props.correlationKey) {
+            extensions.push(`<zeebe:subscription correlationKey="${esc(props.correlationKey as string)}" />`);
+          }
           break;
+        }
         case 'timer':
           if (props.timerDuration) {
             eventDefXml = `\n      <bpmn:timerEventDefinition id="${evtId}">\n        <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">${esc(props.timerDuration as string)}</bpmn:timeDuration>\n      </bpmn:timerEventDefinition>`;
@@ -432,16 +455,36 @@ export function generateXml(diagram: CurrentDiagram): string {
     const hasContent = extXml || multiInstanceXml || eventDefXml;
     const nameAttr = el.name ? ` name="${esc(el.name)}"` : '';
 
+    // attachedToRef for BoundaryEvent elements
+    const attachedToRef = el.type === 'bpmn:BoundaryEvent' && props.attachedToRef
+      ? ` attachedToRef="${esc(props.attachedToRef as string)}"`
+      : '';
+
     if (hasContent) {
-      elementXml += `    <bpmn:${tag} id="${el.id}"${nameAttr}>${extXml}${multiInstanceXml}${eventDefXml}\n    </bpmn:${tag}>\n`;
+      elementXml += `    <bpmn:${tag} id="${el.id}"${nameAttr}${attachedToRef}>${extXml}${multiInstanceXml}${eventDefXml}\n    </bpmn:${tag}>\n`;
     } else {
-      elementXml += `    <bpmn:${tag} id="${el.id}"${nameAttr} />\n`;
+      elementXml += `    <bpmn:${tag} id="${el.id}"${nameAttr}${attachedToRef} />\n`;
     }
 
-    // Diagram shape
-    const isExpanded =
-      el.type === 'bpmn:SubProcess' || el.type === 'bpmn:AdHocSubProcess';
-    diagramXml += `      <bpmndi:BPMNShape id="${el.id}_di" bpmnElement="${el.id}"${isExpanded ? ' isExpanded="true"' : ''}>\n        <dc:Bounds x="${x}" y="${y}" width="${w}" height="${h}" />\n      </bpmndi:BPMNShape>\n`;
+    // Diagram shape — boundary events snap to host element bottom-center if attachedToRef is set
+    const isExpanded = el.type === 'bpmn:SubProcess' || el.type === 'bpmn:AdHocSubProcess';
+    let shapeX = x; let shapeY = y;
+    if (el.type === 'bpmn:BoundaryEvent' && props.attachedToRef) {
+      const host = elements[props.attachedToRef as string];
+      if (host) {
+        const hSz = getSize(host.type);
+        const hW = host.size?.width ?? hSz.width;
+        const hH = host.size?.height ?? hSz.height;
+        // Snap to bottom-center of host, offset index based on how many boundary events attach to same host
+        const siblingsOnSameHost = Object.values(elements).filter(
+          e2 => e2.type === 'bpmn:BoundaryEvent' && e2.properties.attachedToRef === props.attachedToRef && e2.id !== el.id
+        );
+        const siblingIndex = siblingsOnSameHost.length;
+        shapeX = host.position.x + Math.round(hW * 0.25) + siblingIndex * 40;
+        shapeY = host.position.y + hH - 18; // 18 = half of boundary event height
+      }
+    }
+    diagramXml += `      <bpmndi:BPMNShape id="${el.id}_di" bpmnElement="${el.id}"${isExpanded ? ' isExpanded="true"' : ''}>\n        <dc:Bounds x="${shapeX}" y="${shapeY}" width="${w}" height="${h}" />\n      </bpmndi:BPMNShape>\n`;
   }
 
   // Sequence flows
@@ -473,13 +516,17 @@ export function generateXml(diagram: CurrentDiagram): string {
       ? '\n  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
       : '';
 
+  const msgDecls = messageDeclarations.length > 0
+    ? '\n' + messageDeclarations.join('\n') + '\n'
+    : '';
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
   xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
   xmlns:di="http://www.omg.org/spec/DD/20100524/DI"${zeebeNs}${xsiNs}
   id="Definitions_1"
-  targetNamespace="http://bpmn.io/schema/bpmn">
+  targetNamespace="http://bpmn.io/schema/bpmn">${msgDecls}
   <bpmn:process id="${processId}" name="${esc(name)}" isExecutable="true">
 ${elementXml}  </bpmn:process>
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
@@ -491,6 +538,12 @@ ${diagramXml}    </bpmndi:BPMNPlane>
 
 // ── XML Parser (import existing BPMN) ─────────────────────────────────────────
 
+/** Extract value of an XML attribute from a tag string */
+function attr(tag: string, name: string): string | undefined {
+  const m = tag.match(new RegExp(`${name}="([^"]*)"`));
+  return m ? m[1] : undefined;
+}
+
 export function parseXmlToState(xml: string): Partial<CurrentDiagram> {
   const processMatch = xml.match(
     /<bpmn:process[^>]+id="([^"]+)"(?:[^>]+name="([^"]+)")?/,
@@ -501,35 +554,228 @@ export function parseXmlToState(xml: string): Partial<CurrentDiagram> {
   const elements: Record<string, BpmnElement> = {};
   const connections: Record<string, BpmnConnection> = {};
 
-  // Parse elements
+  // ── Pre-parse bpmn:message declarations (definitions level) ───────────────
+  let m: RegExpExecArray | null;
+  const messageNameMap = new Map<string, string>();
+  const msgDeclRegex = /<bpmn:message\s[^>]*id="([^"]+)"[^>]*name="([^"]+)"/g;
+  while ((m = msgDeclRegex.exec(xml)) !== null) {
+    messageNameMap.set(m[1], m[2]);
+  }
+
+  // ── Parse element opening tags (self-closing or open) ──────────────────────
+  // Match both <bpmn:Foo .../> and <bpmn:Foo ...> (we'll grab body separately)
   const elementRegex =
-    /<bpmn:(\w+)\s[^>]*id="([^"]+)"(?:[^>]*name="([^"]+)")?[^>]*\/?>/g;
-  let m;
+    /<bpmn:(\w+)\s([^>]*?)\/?>/g;
   const SKIP = new Set([
-    'process',
-    'definitions',
-    'sequenceFlow',
-    'collaboration',
-    'participant',
-    'messageFlow',
+    'process', 'definitions', 'sequenceFlow', 'collaboration',
+    'participant', 'messageFlow', 'extensionElements',
+    'timerEventDefinition', 'errorEventDefinition', 'messageEventDefinition',
+    'signalEventDefinition', 'escalationEventDefinition',
+    'compensateEventDefinition', 'conditionalEventDefinition',
+    'terminateEventDefinition', 'multiInstanceLoopCharacteristics',
+    'timeDuration', 'timeCycle', 'timeDate', 'conditionExpression',
+    'incoming', 'outgoing',
   ]);
+
   while ((m = elementRegex.exec(xml)) !== null) {
-    const [, rawTag, id, elName] = m;
+    const [, rawTag, attrs] = m;
     if (SKIP.has(rawTag)) continue;
+    const id = attr(attrs, 'id');
+    if (!id) continue;
+    const elName = attr(attrs, 'name') ?? '';
+    const attachedToRef = attr(attrs, 'attachedToRef');
     const capitalTag = rawTag.charAt(0).toUpperCase() + rawTag.slice(1);
     const type = `bpmn:${capitalTag}`;
     const sz = getSize(type);
-    elements[id] = {
-      id,
-      type,
-      name: elName ?? '',
-      position: { x: 100, y: 100 },
-      size: sz,
-      properties: {},
-    };
+    const props: Record<string, unknown> = {};
+    if (attachedToRef) props.attachedToRef = attachedToRef;
+    elements[id] = { id, type, name: elName, position: { x: 100, y: 100 }, size: sz, properties: props };
   }
 
-  // Parse BPMNShape positions
+  // ── Parse Zeebe extension elements per element ────────────────────────────
+  // Strategy: for each known element ID, find its extensionElements block in the XML
+  for (const [id, el] of Object.entries(elements)) {
+    if (SKIP.has(el.type.replace('bpmn:', ''))) continue;
+    const props = el.properties;
+
+    // Find the extensionElements block for this specific element id
+    // Locate the element opening tag, then find its extensionElements
+    const idPattern = new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)<\\/bpmn:${el.type.replace('bpmn:', '')}>`, 'i');
+    const elBodyMatch = xml.match(idPattern);
+    const body = elBodyMatch?.[1] ?? '';
+
+    // zeebe:taskDefinition
+    const tdM = body.match(/<zeebe:taskDefinition\s([^>]*?)\/>/);
+    if (tdM) {
+      const t = attr(tdM[1], 'type');
+      const r = attr(tdM[1], 'retries');
+      if (t) props.zeebeTaskType = t;
+      if (r) props.zeebeRetries = parseInt(r, 10);
+    }
+
+    // zeebe:assignmentDefinition
+    const adM = body.match(/<zeebe:assignmentDefinition\s([^>]*?)\/>/);
+    if (adM) {
+      const assignee = attr(adM[1], 'assignee');
+      const cg = attr(adM[1], 'candidateGroups');
+      const pri = attr(adM[1], 'priority');
+      if (assignee) props.assignee = assignee;
+      if (cg) props.candidateGroups = cg;
+      if (pri) props.priority = pri;
+    }
+
+    // zeebe:formDefinition
+    const fdM = body.match(/<zeebe:formDefinition\s([^>]*?)\/>/);
+    if (fdM) {
+      const formId = attr(fdM[1], 'formId');
+      if (formId) props.formId = formId;
+    }
+
+    // zeebe:taskSchedule
+    const tsM = body.match(/<zeebe:taskSchedule\s([^>]*?)\/>/);
+    if (tsM) {
+      const dd = attr(tsM[1], 'dueDate');
+      const fd2 = attr(tsM[1], 'followUpDate');
+      if (dd) props.dueDate = dd;
+      if (fd2) props.followUpDate = fd2;
+    }
+
+    // zeebe:calledDecision
+    const cdM = body.match(/<zeebe:calledDecision\s([^>]*?)\/>/);
+    if (cdM) {
+      const did = attr(cdM[1], 'decisionId');
+      const rv = attr(cdM[1], 'resultVariable');
+      if (did) props.decisionId = did;
+      if (rv) props.resultVariable = rv;
+    }
+
+    // zeebe:calledElement
+    const ceM = body.match(/<zeebe:calledElement\s([^>]*?)\/>/);
+    if (ceM) {
+      const pe = attr(ceM[1], 'processId');
+      const pav = attr(ceM[1], 'propagateAllChildVariables');
+      if (pe) props.calledElement = pe;
+      if (pav !== undefined) props.propagateAllVariables = pav === 'true';
+    }
+
+    // zeebe:script
+    const scM = body.match(/<zeebe:script\s([^>]*?)\/>/);
+    if (scM) {
+      const exp = attr(scM[1], 'expression');
+      const rv = attr(scM[1], 'resultVariable');
+      if (exp) props.scriptExpression = exp;
+      if (rv) props.scriptResultVariable = rv;
+    }
+
+    // zeebe:taskHeaders
+    const thM = body.match(/<zeebe:taskHeaders>([\s\S]*?)<\/zeebe:taskHeaders>/);
+    if (thM) {
+      const headers: Array<{ key: string; value: string }> = [];
+      const hReg = /<zeebe:header\s([^>]*?)\/>/g;
+      let hM: RegExpExecArray | null;
+      while ((hM = hReg.exec(thM[1])) !== null) {
+        const k = attr(hM[1], 'key');
+        const v = attr(hM[1], 'value');
+        if (k !== undefined && v !== undefined) headers.push({ key: k, value: v });
+      }
+      if (headers.length) props.zeebeHeaders = headers;
+    }
+
+    // zeebe:ioMapping
+    const ioM = body.match(/<zeebe:ioMapping>([\s\S]*?)<\/zeebe:ioMapping>/);
+    if (ioM) {
+      const ins: Array<{ source: string; target: string }> = [];
+      const outs: Array<{ source: string; target: string }> = [];
+      const inReg = /<zeebe:input\s([^>]*?)\/>/g;
+      const outReg = /<zeebe:output\s([^>]*?)\/>/g;
+      let ioEntry: RegExpExecArray | null;
+      while ((ioEntry = inReg.exec(ioM[1])) !== null) {
+        const s = attr(ioEntry[1], 'source');
+        const t = attr(ioEntry[1], 'target');
+        if (s && t) ins.push({ source: s, target: t });
+      }
+      while ((ioEntry = outReg.exec(ioM[1])) !== null) {
+        const s = attr(ioEntry[1], 'source');
+        const t = attr(ioEntry[1], 'target');
+        if (s && t) outs.push({ source: s, target: t });
+      }
+      if (ins.length) props.zeebeInputs = ins;
+      if (outs.length) props.zeebeOutputs = outs;
+    }
+
+    // zeebe:loopCharacteristics (multi-instance)
+    const lcM = body.match(/<zeebe:loopCharacteristics\s([^>]*?)\/>/);
+    if (lcM) {
+      const ic = attr(lcM[1], 'inputCollection');
+      const ie = attr(lcM[1], 'inputElement');
+      const oc = attr(lcM[1], 'outputCollection');
+      const oe = attr(lcM[1], 'outputElement');
+      if (ic) props.multiInstanceInputCollection = ic;
+      if (ie) props.multiInstanceInputElement = ie;
+      if (oc) props.multiInstanceOutputCollection = oc;
+      if (oe) props.multiInstanceOutputElement = oe;
+    }
+
+    // multiInstanceLoopCharacteristics isSequential
+    const miM = body.match(/<bpmn:multiInstanceLoopCharacteristics\s([^>]*?)>/);
+    if (miM) {
+      props.multiInstanceIsSequential = attr(miM[1], 'isSequential') === 'true';
+    }
+
+    // Event definitions
+    if (body.match(/<bpmn:messageEventDefinition/)) {
+      props.eventDefinition = 'message';
+      const msgRefM2 = body.match(/<bpmn:messageEventDefinition[^>]*messageRef="([^"]+)"/);
+      if (msgRefM2) {
+        props.messageRef = msgRefM2[1];
+        // Resolve name from declaration map
+        const resolvedName = messageNameMap.get(msgRefM2[1]);
+        if (resolvedName) props.messageName = resolvedName;
+      }
+    }
+    if (body.match(/<bpmn:errorEventDefinition/)) {
+      props.eventDefinition = 'error';
+      const errM = body.match(/<bpmn:errorEventDefinition[^>]*errorRef="([^"]+)"/);
+      if (errM) props.errorCode = errM[1];
+    }
+    if (body.match(/<bpmn:escalationEventDefinition/)) props.eventDefinition = 'escalation';
+    if (body.match(/<bpmn:compensateEventDefinition/)) props.eventDefinition = 'compensation';
+    if (body.match(/<bpmn:conditionalEventDefinition/)) props.eventDefinition = 'conditional';
+    if (body.match(/<bpmn:terminateEventDefinition/)) props.eventDefinition = 'terminate';
+    if (body.match(/<bpmn:signalEventDefinition/)) {
+      props.eventDefinition = 'signal';
+      const sigM = body.match(/<bpmn:signalEventDefinition[^>]*signalRef="([^"]+)"/);
+      if (sigM) props.signalRef = sigM[1];
+    }
+
+    // Timer: look inside timerEventDefinition body
+    const timerBodyM = body.match(/<bpmn:timerEventDefinition[^>]*>([\s\S]*?)<\/bpmn:timerEventDefinition>/);
+    if (timerBodyM) {
+      props.eventDefinition = 'timer';
+      const tb = timerBodyM[1];
+      const durM = tb.match(/<bpmn:timeDuration[^>]*>([\s\S]*?)<\/bpmn:timeDuration>/);
+      if (durM) props.timerDuration = durM[1].trim();
+      const cycM = tb.match(/<bpmn:timeCycle[^>]*>([\s\S]*?)<\/bpmn:timeCycle>/);
+      if (cycM) props.timerCycle = cycM[1].trim();
+      const datM = tb.match(/<bpmn:timeDate[^>]*>([\s\S]*?)<\/bpmn:timeDate>/);
+      if (datM) props.timerDate = datM[1].trim();
+    }
+
+    // messageName (from zeebe:subscription or direct attribute)
+    const msgNameM = body.match(/messageName="([^"]+)"/);
+    if (msgNameM) props.messageName = msgNameM[1];
+    const msgRefM = body.match(/<bpmn:messageEventDefinition[^>]*messageRef="([^"]+)"/);
+    if (msgRefM) props.messageRef = msgRefM[1];
+
+    // zeebe:subscription (correlationKey for message catch events)
+    const subM = body.match(/<zeebe:subscription\s([^>]*?)\/>/);
+    if (subM) {
+      const ck = attr(subM[1], 'correlationKey');
+      if (ck) props.correlationKey = ck;
+    }
+  }
+
+  // ── Parse BPMNShape positions ──────────────────────────────────────────────
   const shapeRegex =
     /<bpmndi:BPMNShape[^>]+bpmnElement="([^"]+)"[^>]*>[\s\S]*?<dc:Bounds\s+x="([^"]+)"\s+y="([^"]+)"\s+width="([^"]+)"\s+height="([^"]+)"/g;
   while ((m = shapeRegex.exec(xml)) !== null) {
@@ -540,16 +786,17 @@ export function parseXmlToState(xml: string): Partial<CurrentDiagram> {
     }
   }
 
-  // Parse sequence flows
+  // ── Parse sequence flows ───────────────────────────────────────────────────
   const flowRegex =
-    /<bpmn:sequenceFlow\s[^>]*id="([^"]+)"[^>]*sourceRef="([^"]+)"[^>]*targetRef="([^"]+)"[^>]*(?:name="([^"]+)")?[^>]*\/?>/g;
+    /<bpmn:sequenceFlow\s[^>]*id="([^"]+)"[^>]*sourceRef="([^"]+)"[^>]*targetRef="([^"]+)"(?:[^>]*name="([^"]+)")?[^>]*(?:conditionExpression[^>]*>([^<]*)<\/bpmn:conditionExpression)?[^>]*\/?>/g;
   while ((m = flowRegex.exec(xml)) !== null) {
     const [, id, source, target, label] = m;
+    // Also try to get condition from inline attribute
+    const fullMatch = m[0];
+    const condAttrM = fullMatch.match(/conditionExpression="([^"]*)"/);
     connections[id] = {
-      id,
-      source,
-      target,
-      label,
+      id, source, target, label,
+      condition: condAttrM?.[1],
       type: 'bpmn:SequenceFlow',
     };
   }

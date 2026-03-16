@@ -15,7 +15,7 @@ new_sqlite_classes = ["BpmnMcpAgent"]
 # KV — persistent BPMN file storage (cross-session)
 [[kv_namespaces]]
 binding = "BPMN_FILES"
-id = "3001cbc000244b88831db8456c91306c"
+id = "91bb4e456c4b4c1cb266ff9758576663"
 
 [vars]
 ENVIRONMENT = "production"

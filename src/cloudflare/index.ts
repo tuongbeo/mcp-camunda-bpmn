@@ -18,7 +18,8 @@ export default {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
           'Access-Control-Allow-Headers':
-            'Content-Type, Accept, mcp-session-id',
+            'Content-Type, Accept, mcp-session-id, Mcp-Session-Id',
+          'Access-Control-Expose-Headers': 'Mcp-Session-Id',
         },
       });
     }
@@ -34,9 +35,28 @@ export default {
 
     // Streamable HTTP transport (/mcp) — Camunda 8.9+, Claude Code
     if (url.pathname === '/mcp' || url.pathname === '/mcp/') {
-      return BpmnMcpAgent.serve('/mcp', {
+      const mcpResponse = await BpmnMcpAgent.serve('/mcp', {
         binding: 'MCP_BPMN_AGENT',
       }).fetch(request, env, ctx);
+
+      // Ensure Mcp-Session-Id is always present so Claude.ai keeps
+      // stable session state and does not reset tool permissions.
+      const headers = new Headers(mcpResponse.headers);
+      if (!headers.has('Mcp-Session-Id')) {
+        headers.set('Mcp-Session-Id', 'camunda-bpmn-public-server');
+      }
+      const expose = headers.get('Access-Control-Expose-Headers') ?? '';
+      if (!expose.toLowerCase().includes('mcp-session-id')) {
+        headers.set(
+          'Access-Control-Expose-Headers',
+          expose ? `${expose}, Mcp-Session-Id` : 'Mcp-Session-Id',
+        );
+      }
+      return new Response(mcpResponse.body, {
+        status: mcpResponse.status,
+        statusText: mcpResponse.statusText,
+        headers,
+      });
     }
 
     // Legacy SSE transport (/sse) — Camunda 8.8, Claude Desktop
